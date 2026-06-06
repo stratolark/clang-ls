@@ -14,6 +14,11 @@
 int main(int argc, char *argv[]){
     printf("hello from world \n");
     // print: take the first argument, which is always the name of the program
-    printf("%s \n", argv[0]);
+    char *first_arg = argv[1];
+    if (first_arg == NULL){
+        printf("Warning: no argument passed. \n");
+        return 0;
+    }
+    printf("%s \n", first_arg);
     return 0;
 }

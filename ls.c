@@ -21,6 +21,15 @@
 //     printf("%s \n", first_arg);
 //     return 0;
 // }
+
+// TODO:
+// 1. Sort output alphabetically.
+// 2. Add the "total" line for -l.
+// 3. Support -d because you already tested it.
+// 4. Add -A to show hidden files but skip "." and "..".
+// 5. Make Windows permissions visually honest, maybe rwx------ or rw-/--- is fine, but document
+// that it is approximate.
+
 // On Linux/POSIX, this asks the headers to expose POSIX functions like lstat().
 // This must be defined before including system headers.
 #ifndef _WIN32
@@ -53,6 +62,7 @@
 
 // whether to show or not the "." files in the dir
 int show_all = 0;
+// whether to print the long format of the files
 int long_format = 0;
 
 // Join "dir" and "name" into one full path.

@@ -49,7 +49,7 @@ int main(int argc, char *argv[]){
 
     // while there are entries, print their names
     while ((entry = readdir(dir)) != NULL) {
-        // check if the first name is a dot, skipping it. Here we use single '' that creates a normal char, instead of "" which is a pointer char
+        // check if the first element of the name is a dot, skipping it. Here we use single '' that creates a normal char, instead of "" which is a pointer char
         if (entry->d_name[0] == '.') {
             // continue means, exit the iteration
             continue;

@@ -1,0 +1,4 @@
+# .clangd
+CompileFlags:
+  Compiler: C:/msys64/ucrt64/bin/gcc.exe
+  Add: [-xc, -std=c17, -Wall, -Wextra]

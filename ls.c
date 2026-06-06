@@ -43,7 +43,22 @@ int main(int argc, char *argv[]){
         // 1 = error code
         return 1;
     }
-    // printf("dir: %s \n", dir);
+
+    // create a reference pointer struct to dirent struc
+    struct dirent *entry;
+
+    // while there are entries, print their names
+    while ((entry = readdir(dir)) != NULL) {
+        // check if the first name is a dot, skipping it. Here we use single '' that creates a normal char, instead of "" which is a pointer char
+        if (entry->d_name[0] == '.') {
+            // continue means, exit the iteration
+            continue;
+        }
+        printf("%s \n", entry->d_name);
+    }
+
+    // close the directory, freeing it to other programs
+    closedir(dir);
 
     return 0;
 }

@@ -22,15 +22,33 @@
 //     return 0;
 // }
 #include <dirent.h>
+#include <process.h>
 #include <stdio.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+
+#ifdef _WIN32
+#define stat_file(path, st) stat((path), (st))
+#else
+#define stat_file(path, st) lstat((path), (st))
+#endif
 
 // take a mode and a string, then do checks
 void mode_string(mode_t mode, char *str) {
 
     // determine first character
     // is this mode a dir
+#ifdef S_ISLNK
+    if (S_ISLNK(mode)) {
+        str[0] = 'l';
+    }
+#endif
+#ifdef S_ISSOCK
+    if (S_ISSOCK(mode)) {
+        str[0] = 's';
+    }
+#endif
     if (S_ISDIR(mode)) {
         str[0] = 'd';
     } else if (S_ISBLK(mode)) {
@@ -60,8 +78,43 @@ void mode_string(mode_t mode, char *str) {
     str[10] = '\0';
 }
 
+// takes a directory string and a name strings
+void print_long(const char *dir, const char *name) {
+    // a buffer to hold the max unix path size
+    char fullpath[4096];
+
+    // used to write formatted data string into a sized character buffer
+    // helps us ensure the path fits in a buffer of the max path size
+    snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, name);
+
+    // initialize an empty struct
+    struct stat st;
+    // on linux is lstat
+    if (stat_file(fullpath, &st) < 0) {
+        perror(name);
+        return;
+    }
+
+    char modes[11];
+    mode_string(st.st_mode, modes);
+
+    struct passwd *pw = getpwuid(st.st_uid);
+    struct group *gr = getgrgid(st.st_uid);
+    const char *user = pw ? pw->pw_name : "?";
+    const char *group = gr ? gr->gr_name : "?";
+
+    char timebuf[64];
+
+    struct tm *tm = localtime(&st.st_mtim.tv_sec);
+    strftime(timebuf, sizeof(timebuf), "%b %e %H:%M", tm);
+
+    printf("%s %lu %s %ld %s %s\n", modes, (unsigned long)st.st_nlink, user, group,
+           (long)st.st_size, timebuf, name);
+}
+
 // whether to show or not the "." files in the dir
-int show_all;
+int show_all = 0;
+int long_format = 0;
 
 // to take parameters we need to change it from void to int argc, char *argv[]
 // int argc = means the argument count, how many words when they ran the program
@@ -73,13 +126,16 @@ int main(int argc, char *argv[]) {
 
     // getopt parses options in the cli for the program and to check for valid
     // options
-    while ((opt = getopt(argc, argv, "a")) != -1) {
+    while ((opt = getopt(argc, argv, "al")) != -1) {
         switch (opt) {
         case 'a':
             show_all = 1;
             break;
+        case 'l':
+            long_format = 1;
+            break;
         default:
-            fprintf(stderr, "usage: %s [-a] [path]\n", argv[0]);
+            fprintf(stderr, "usage: %s [-al] [path]\n", argv[0]);
             return 1;
         }
     }
@@ -113,7 +169,11 @@ int main(int argc, char *argv[]) {
             // continue means, exit the iteration
             continue;
         }
-        printf("%s \n", entry->d_name);
+        if (long_format) {
+            print_long(path, entry->d_name);
+        } else {
+            printf("%s \n", entry->d_name);
+        }
     }
 
     // close the directory, freeing it to other programs

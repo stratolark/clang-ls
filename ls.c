@@ -345,6 +345,21 @@ int main(int argc, char *argv[]) {
     // create a reference pointer struct to dirent struc
     struct dirent *entry;
 
+    // count the number of items inside the dir
+    size_t count = 0;
+    // Initial size
+    size_t capacity = 64;
+
+    // 1. Initial list allocation, Initialize a pointer-to-pointer (char **names) to hold your list
+    // of string addresses
+    char **names_output_buffer = malloc(capacity * sizeof(char *));
+
+    if (names_output_buffer == NULL) {
+        // Handle allocation failure
+        perror("malloc");
+        return 1;
+    }
+
     // while there are entries, print their names
     while ((entry = readdir(dir)) != NULL) {
         // check if the first element of the name is a dot, skipping it. Here we use
@@ -355,9 +370,27 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        // 2. Expand list if full
+        if (count >= capacity) {
+            // increase capacity
+            capacity *= 2;
+            // resize array buffer
+            char **temp_array = realloc(names_output_buffer, capacity * sizeof(char *));
+            if (!temp_array) {
+                // Error handling
+                printf("realloc");
+                break;
+            }
+            names_output_buffer = temp_array;
+        }
+
+        // 3. "Push" name into list (strdup allocates memory for the string copy)
+        names_output_buffer[count++] = strdup(entry->d_name);
+
         if (long_format) {
             print_long(path, entry->d_name);
         } else {
+
             printf("%s\n", entry->d_name);
         }
     }
@@ -365,5 +398,17 @@ int main(int argc, char *argv[]) {
     // close the directory, freeing it to other programs
     closedir(dir);
 
+    // 4. Print and cleanup
+    printf("Items found:\n");
+    for (size_t i = 0; i < count; i++) {
+        printf("[%zu] %s\n", i, names_output_buffer[i]);
+        free(names_output_buffer[i]); // Free individual string
+    }
+
+    // free from memory
+    free(names_output_buffer);
+    names_output_buffer = NULL; // Good practice to prevent dangling pointers
+
+    // exit main with success
     return 0;
 }

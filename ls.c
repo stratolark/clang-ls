@@ -66,6 +66,46 @@ int show_all = 0;
 // whether to print the long format of the files
 int long_format = 0;
 
+// Make our own version of strdup() for portability.
+//
+// strdup() is common, but it is historically POSIX and not guaranteed in strict C17.
+// This function allocates enough memory, copies the string, and returns the copy.
+// The caller must later call free() on the returned pointer.
+char *copy_string(const char *source) {
+    size_t length = strlen(source) + 1; // +1 for the '\0' null terminator
+
+    char *copy = malloc(length);
+
+    if (copy == NULL) {
+        return NULL;
+    }
+
+    memcpy(copy, source, length);
+    return copy;
+}
+
+// qsort() expects a comparator with this shape:
+// int comparator(const void *a, const void *b)
+//
+// Since our array is char **, each element is a char *.
+// But qsort gives us pointers to the elements, so we receive char ** after casting.
+int compare_names(const void *a, const void *b) {
+    const char *const *name_a = a;
+    const char *const *name_b = b;
+
+    return strcmp(*name_a, *name_b);
+}
+
+// Free all strings already copied into the array.
+// This is useful when something fails halfway through reading the directory.
+void free_names(char **names, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free(names[i]);
+    }
+
+    free(names);
+}
+
 // Join "dir" and "name" into one full path.
 //
 // On Linux, paths usually use "/".
@@ -377,24 +417,38 @@ int main(int argc, char *argv[]) {
             capacity *= 2;
             // resize array buffer
             char **temp_array = realloc(names_output_buffer, capacity * sizeof(char *));
-            if (!temp_array) {
-                // Error handling
-                printf("realloc");
-                break;
+
+            if (temp_array == NULL) {
+                perror("realloc");
+                closedir(dir);
+                free_names(names_output_buffer, count);
+                return 1;
             }
-            // set the temp array to the original
+
             names_output_buffer = temp_array;
         }
 
         // 3. "Push" name into list (strdup allocates memory for the string copy)
-        names_output_buffer[count++] = strdup(entry->d_name);
+        char *name_copy = copy_string(entry->d_name);
+
+        if (name_copy == NULL) {
+            perror("copy_string");
+            closedir(dir);
+            free_names(names_output_buffer, count);
+            return 1;
+        }
+
+        names_output_buffer[count++] = name_copy;
     }
 
     // close the directory, freeing it to other programs
     closedir(dir);
+    qsort(names_output_buffer, count, sizeof(names_output_buffer[0]), compare_names);
 
     // 4. Print and cleanup
-    printf("total %zu\n", count);
+    if (long_format) {
+        printf("entries %zu\n", count);
+    }
     for (size_t i = 0; i < count; i++) {
         // printf("[%zu] %s\n", i, names_output_buffer[i]);
         if (long_format) {

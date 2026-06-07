@@ -359,6 +359,102 @@ const char *parse_args(int argc, char *argv[]) {
     return path;
 }
 
+// GNU ls normally prints total allocation in 1024-byte blocks.
+// We keep this as a constant so the conversion is easy to understand.
+#define LS_BLOCK_SIZE 1024ULL
+
+// Integer division that rounds upward.
+// Example:
+//   1 byte / 1024 -> 1 block
+//   1024 bytes / 1024 -> 1 block
+//   1025 bytes / 1024 -> 2 blocks
+unsigned long long round_up_div_ull(unsigned long long value, unsigned long long divisor) {
+    if (value == 0) {
+        return 0;
+    }
+
+    return (value + divisor - 1) / divisor;
+}
+
+// Return how many 1024-byte "ls blocks" this file uses.
+//
+// Linux:
+//   st_blocks is allocation count in 512-byte units.
+//   GNU ls prints total in 1024-byte units by default.
+//   So we convert 512-byte blocks -> 1024-byte blocks.
+//
+// Windows:
+//   struct stat does not give us Unix-like st_blocks.
+//   So we open the file and ask Windows for FILE_STANDARD_INFO.AllocationSize.
+unsigned long long allocated_blocks_1024(const char *path, const struct stat *st) {
+#ifdef _WIN32
+    (void)st;
+
+    HANDLE handle =
+        CreateFileA(path,
+                    0, // We are not reading file contents; we only want metadata.
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS, // Allows opening directories too.
+                    NULL);
+
+    if (handle == INVALID_HANDLE_VALUE) {
+        // Fallback for learning purposes:
+        // if Windows metadata fails, estimate from logical size.
+        return round_up_div_ull((unsigned long long)st->st_size, LS_BLOCK_SIZE);
+    }
+
+    FILE_STANDARD_INFO info;
+
+    BOOL ok = GetFileInformationByHandleEx(handle, FileStandardInfo, &info, sizeof(info));
+
+    CloseHandle(handle);
+
+    if (!ok) {
+        // Fallback for learning purposes.
+        return round_up_div_ull((unsigned long long)st->st_size, LS_BLOCK_SIZE);
+    }
+
+    return round_up_div_ull((unsigned long long)info.AllocationSize.QuadPart, LS_BLOCK_SIZE);
+#else
+    (void)path;
+
+    // Linux st_blocks is in 512-byte units.
+    // GNU ls default total is in 1024-byte units.
+    // So 2 stat blocks = 1 ls block.
+    //
+    // We round up because 1 allocated 512-byte block should still show as 1
+    // 1024-byte ls block, not 0.
+    return (unsigned long long)((st->st_blocks + 1) / 2);
+#endif
+}
+
+// Calculate the "total" line for a directory listing.
+//
+// This loops through the names you already collected, stats each one,
+// asks how much filesystem allocation it uses, and sums the result.
+unsigned long long directory_total_blocks_1024(const char *dir, char **names, size_t count) {
+    unsigned long long total = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        char fullpath[PATH_BUFFER_SIZE];
+
+        join_path(fullpath, sizeof(fullpath), dir, names[i]);
+
+        struct stat st;
+
+        if (stat_file(fullpath, &st) < 0) {
+            // If we cannot stat one file, skip it.
+            // Real ls has more nuanced behavior, but this is enough for learning.
+            perror(fullpath);
+            continue;
+        }
+
+        total += allocated_blocks_1024(fullpath, &st);
+    }
+
+    return total;
+}
+
 // to take parameters we need to change it from void to int argc, char *argv[]
 // int argc = means the argument count, how many words when they ran the program
 // char *argv[] = a pointer to a pointer of an array of strings, in C strings
@@ -447,7 +543,10 @@ int main(int argc, char *argv[]) {
 
     // 4. Print and cleanup
     if (long_format) {
-        printf("entries %zu\n", count);
+        unsigned long long total_blocks =
+            directory_total_blocks_1024(path, names_output_buffer, count);
+
+        printf("total %llu\n", total_blocks);
     }
     for (size_t i = 0; i < count; i++) {
         // printf("[%zu] %s\n", i, names_output_buffer[i]);

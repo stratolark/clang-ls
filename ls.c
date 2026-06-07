@@ -1,42 +1,20 @@
+// Fast-ish, memory-safe learning version of a small ls-like program.
+//
+// Build on Linux/POSIX:
+//   gcc -std=c17 -O2 -Wall -Wextra -Wpedantic -Wconversion -Wshadow -o lsbtw ls.c
+//
+// Notes:
+// - POSIX path uses fstatat(dirfd(...), name, ..., AT_SYMLINK_NOFOLLOW) for directory entries.
+// - Windows support here assumes a C environment that provides <dirent.h>, such as MinGW.
+//   Native MSVC does not provide POSIX opendir()/readdir() by default.
 
-// main function that takes no arguments, returns an int. 0 = success
-// #include <stdio.h>
-// int main(void){
-//     printf("hello from world");
-//     return 0;
-// }
-
-// // to take parameters we need to change it from void to int argc, char
-// *argv[]
-// // int argc = means the argument count, how many words when they ran the
-// program
-// // char *argv[] = a pointer to a pointer of an array of strings, in C strings
-// are an array of chars int main(int argc, char *argv[]){
-//     printf("hello from world \n");
-//     // print: take the first argument, which is always the name of the
-//     program char *first_arg = argv[1]; if (first_arg == NULL){
-//         printf("Warning: no argument passed. \n");
-//         return 0;
-//     }
-//     printf("%s \n", first_arg);
-//     return 0;
-// }
-
-// TODO:
-// 1. Sort output alphabetically.
-// 2. Add the "total" line for -l.
-// 3. Support -d because you already tested it.
-// 4. Add -A to show hidden files but skip "." and "..".
-// 5. Make Windows permissions visually honest, maybe rwx------ or rw-/--- is fine, but document
-// that it is approximate.
-
-// On Linux/POSIX, this asks the headers to expose POSIX functions like lstat().
-// This must be defined before including system headers.
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
 #endif
 
 #include <dirent.h>
+#include <errno.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,94 +24,208 @@
 #include <time.h>
 
 #ifdef _WIN32
-// Windows-specific API. We use this only for file attributes like
-// FILE_ATTRIBUTE_REPARSE_POINT, which can help us detect symlinks/junctions.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
-// These are POSIX/Linux headers.
-// They do not exist in normal native Windows C environments.
+#include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
 #include <unistd.h>
 #endif
 
-// A simple max path buffer for this learning project.
-// Real production code should avoid fixed-size path buffers where possible.
 #define PATH_BUFFER_SIZE 4096
+#define INITIAL_ENTRY_CAPACITY 64
+#define LS_BLOCK_SIZE 1024ULL
+#define OUTPUT_BUFFER_SIZE (1u << 20)
+#define NAME_FIELD_SIZE 64
 
-// whether to show or not the "." files in the dir
-int show_all = 0;
-// whether to print the long format of the files
-int long_format = 0;
+#ifndef _WIN32
+#define NAME_CACHE_LIMIT 64
+#endif
 
-// Make our own version of strdup() for portability.
-//
-// strdup() is common, but it is historically POSIX and not guaranteed in strict C17.
-// This function allocates enough memory, copies the string, and returns the copy.
-// The caller must later call free() on the returned pointer.
-char *copy_string(const char *source) {
-    size_t length = strlen(source) + 1; // +1 for the '\0' null terminator
+typedef struct Options {
+    int show_all;         // -a: include hidden entries, including . and ..
+    int almost_all;       // -A: include hidden entries, but skip . and ..
+    int long_format;      // -l
+    int directory_itself; // -d: show the directory entry itself, not its contents
+} Options;
 
-    char *copy = malloc(length);
+typedef struct DirectoryEntry {
+    char *name;
+    struct stat st;
+    unsigned long long blocks;
+    int has_stat;
+} DirectoryEntry;
 
+#ifdef _WIN32
+typedef struct NameCache {
+    int unused;
+} NameCache;
+#else
+typedef struct UserCacheEntry {
+    uid_t uid;
+    char name[NAME_FIELD_SIZE];
+} UserCacheEntry;
+
+typedef struct GroupCacheEntry {
+    gid_t gid;
+    char name[NAME_FIELD_SIZE];
+} GroupCacheEntry;
+
+typedef struct NameCache {
+    UserCacheEntry users[NAME_CACHE_LIMIT];
+    GroupCacheEntry groups[NAME_CACHE_LIMIT];
+    size_t user_count;
+    size_t group_count;
+} NameCache;
+#endif
+
+static void print_usage(const char *program_name) {
+    fprintf(stderr, "usage: %s [-aAld] [path]\n", program_name ? program_name : "myls");
+}
+
+static int is_dot_or_dotdot(const char *name) {
+    return strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
+}
+
+static int should_skip_name(const Options *options, const char *name) {
+    if (options->show_all) {
+        return 0;
+    }
+
+    if (options->almost_all) {
+        return is_dot_or_dotdot(name);
+    }
+
+    return name[0] == '.';
+}
+
+static int parse_args(int argc, char *argv[], Options *options, const char **path) {
+    *options = (Options){0};
+    *path = ".";
+
+    int path_was_set = 0;
+
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+
+        if (strcmp(arg, "--help") == 0) {
+            print_usage(argv[0]);
+            return 1;
+        }
+
+        if (arg[0] == '-' && arg[1] != '\0') {
+            for (size_t j = 1; arg[j] != '\0'; j++) {
+                switch (arg[j]) {
+                case 'a':
+                    options->show_all = 1;
+                    break;
+                case 'A':
+                    options->almost_all = 1;
+                    break;
+                case 'l':
+                    options->long_format = 1;
+                    break;
+                case 'd':
+                    options->directory_itself = 1;
+                    break;
+                default:
+                    fprintf(stderr, "unknown option: -%c\n", arg[j]);
+                    print_usage(argv[0]);
+                    return -1;
+                }
+            }
+        } else {
+            if (path_was_set) {
+                fprintf(stderr, "only one path is supported in this learning version\n");
+                print_usage(argv[0]);
+                return -1;
+            }
+
+            *path = arg;
+            path_was_set = 1;
+        }
+    }
+
+    // If both are present, -a wins over -A.
+    if (options->show_all) {
+        options->almost_all = 0;
+    }
+
+    return 0;
+}
+
+static char *copy_string(const char *source) {
+    size_t length = strlen(source);
+
+    if (length == SIZE_MAX) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    char *copy = malloc(length + 1);
     if (copy == NULL) {
         return NULL;
     }
 
-    memcpy(copy, source, length);
+    memcpy(copy, source, length + 1);
     return copy;
 }
 
-// qsort() expects a comparator with this shape:
-// int comparator(const void *a, const void *b)
-//
-// Since our array is char **, each element is a char *.
-// But qsort gives us pointers to the elements, so we receive char ** after casting.
-int compare_names(const void *a, const void *b) {
-    const char *const *name_a = a;
-    const char *const *name_b = b;
-
-    return strcmp(*name_a, *name_b);
-}
-
-// Free all strings already copied into the array.
-// This is useful when something fails halfway through reading the directory.
-void free_names(char **names, size_t count) {
-    for (size_t i = 0; i < count; i++) {
-        free(names[i]);
+static void free_entries(DirectoryEntry *entries, size_t count) {
+    if (entries == NULL) {
+        return;
     }
 
-    free(names);
+    for (size_t i = 0; i < count; i++) {
+        free(entries[i].name);
+    }
+
+    free(entries);
 }
 
-// Join "dir" and "name" into one full path.
-//
-// On Linux, paths usually use "/".
-// On Windows, paths usually use "\", although many Windows APIs also accept "/".
-// We keep this explicit because you are learning portability.
-void join_path(char *out, size_t out_size, const char *dir, const char *name) {
+static int grow_entries(DirectoryEntry **entries, size_t *capacity) {
+    if (*capacity > SIZE_MAX / 2) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    size_t new_capacity = *capacity * 2;
+
+    if (new_capacity > SIZE_MAX / sizeof(**entries)) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    DirectoryEntry *resized = realloc(*entries, new_capacity * sizeof(**entries));
+    if (resized == NULL) {
+        return -1;
+    }
+
+    *entries = resized;
+    *capacity = new_capacity;
+    return 0;
+}
+
 #ifdef _WIN32
+static int join_path_checked(char *out, size_t out_size, const char *dir, const char *name) {
     const char *separator = "\\";
-#else
-    const char *separator = "/";
-#endif
 
     size_t dir_len = strlen(dir);
-
-    // If dir already ends with "/" or "\", do not add another separator.
     int needs_separator = dir_len > 0 && dir[dir_len - 1] != '/' && dir[dir_len - 1] != '\\';
 
-    snprintf(out, out_size, "%s%s%s", dir, needs_separator ? separator : "", name);
-}
+    int written = snprintf(out, out_size, "%s%s%s", dir, needs_separator ? separator : "", name);
 
-// Portable wrapper around stat/lstat.
-//
-// Linux:
-//   lstat() gives information about the link itself if the path is a symlink.
-// Windows:
-//   stat() is available, but Windows does not expose the same POSIX symlink model.
-int stat_file(const char *path, struct stat *st) {
+    if (written < 0 || (size_t)written >= out_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    return 0;
+}
+#endif
+
+static int stat_path_no_follow(const char *path, struct stat *st) {
 #ifdef _WIN32
     return stat(path, st);
 #else
@@ -141,37 +233,80 @@ int stat_file(const char *path, struct stat *st) {
 #endif
 }
 
-// Determine the first character of ls -l output:
-//
-// '-' regular file
-// 'd' directory
-// 'l' symbolic link
-// 'b' block device
-// 'c' character device
-// 'p' FIFO / pipe
-// 's' socket
-//
-// Not every operating system supports every file type.
-// That is why we use #ifdef around some macros.
-char file_type_char(const char *path, mode_t mode) {
+static int stat_entry_in_open_dir(DIR *dir, const char *dir_path, const char *name,
+                                  struct stat *st) {
 #ifdef _WIN32
-    // On Windows, symlinks and junctions are represented as reparse points.
-    // FILE_ATTRIBUTE_REPARSE_POINT includes symbolic links, but also other
-    // reparse-point types such as junctions. For this learning project, we
-    // display any reparse point as 'l'.
+    char fullpath[PATH_BUFFER_SIZE];
+
+    if (join_path_checked(fullpath, sizeof(fullpath), dir_path, name) < 0) {
+        return -1;
+    }
+
+    return stat(fullpath, st);
+#else
+    (void)dir_path;
+
+    int dir_fd = dirfd(dir);
+    if (dir_fd < 0) {
+        return -1;
+    }
+
+    return fstatat(dir_fd, name, st, AT_SYMLINK_NOFOLLOW);
+#endif
+}
+
+#ifdef _WIN32
+static unsigned long long round_up_div_ull(unsigned long long value, unsigned long long divisor) {
+    if (value == 0) {
+        return 0;
+    }
+
+    return (value + divisor - 1) / divisor;
+}
+#endif
+
+static unsigned long long allocated_blocks_1024(const char *path, const struct stat *st) {
+#ifdef _WIN32
+    HANDLE handle = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+
+    if (handle == INVALID_HANDLE_VALUE) {
+        return round_up_div_ull((unsigned long long)st->st_size, LS_BLOCK_SIZE);
+    }
+
+    FILE_STANDARD_INFO info;
+    BOOL ok = GetFileInformationByHandleEx(handle, FileStandardInfo, &info, sizeof(info));
+
+    CloseHandle(handle);
+
+    if (!ok) {
+        return round_up_div_ull((unsigned long long)st->st_size, LS_BLOCK_SIZE);
+    }
+
+    return round_up_div_ull((unsigned long long)info.AllocationSize.QuadPart, LS_BLOCK_SIZE);
+#else
+    (void)path;
+
+    // On Linux, st_blocks is reported in 512-byte units.
+    // Convert to 1024-byte ls-like units.
+    return (unsigned long long)((st->st_blocks + 1) / 2);
+#endif
+}
+
+static char file_type_char(const char *path, mode_t mode) {
+#ifdef _WIN32
     DWORD attrs = GetFileAttributesA(path);
 
     if (attrs != INVALID_FILE_ATTRIBUTES) {
-        if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+        if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
             return 'l';
         }
 
-        if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
             return 'd';
         }
     }
 #else
-    // On Linux/POSIX, lstat() lets S_ISLNK() detect a symlink without following it.
     (void)path;
 
 #ifdef S_ISLNK
@@ -214,26 +349,14 @@ char file_type_char(const char *path, mode_t mode) {
     return '-';
 }
 
-// take a mode and a string, then do checks
-void mode_string(const char *path, mode_t mode, char *str) {
-    // determine first character
-    // is this mode a dir, symlink, regular file, etc.
+static void mode_string(const char *path, mode_t mode, char str[11]) {
     str[0] = file_type_char(path, mode);
 
-    // build the permissions string
-    // we use the bitwise and & operator
-    // It only keeps bits that are set on both sides and returns either non 0 for true 0 for false
     str[1] = (mode & S_IRUSR) ? 'r' : '-';
     str[2] = (mode & S_IWUSR) ? 'w' : '-';
     str[3] = (mode & S_IXUSR) ? 'x' : '-';
 
 #ifdef _WIN32
-    // Windows does not have the same owner/group/other permission model as Unix.
-    // MinGW may expose some permission bits, but they do not mean exactly the same
-    // thing as Linux permissions.
-    //
-    // To avoid pretending Windows has full Unix permissions, we only show user bits
-    // and leave group/other as "-".
     str[4] = '-';
     str[5] = '-';
     str[6] = '-';
@@ -249,429 +372,318 @@ void mode_string(const char *path, mode_t mode, char *str) {
     str[9] = (mode & S_IXOTH) ? 'x' : '-';
 #endif
 
-    // null terminator, null byte, it tells to stop printing
     str[10] = '\0';
 }
 
-// Convert uid/gid into readable user/group strings.
-//
-// Linux:
-//   Use getpwuid() and getgrgid().
-//
-// Windows:
-//   The normal Windows stat fields st_uid/st_gid are not useful.
-//   So we print "-" for now.
-void owner_group_strings(const struct stat *st, char *user, size_t user_size, char *group,
-                         size_t group_size) {
+static int localtime_safe(const time_t *time_value, struct tm *out) {
+#ifdef _WIN32
+    return localtime_s(out, time_value) == 0;
+#else
+    return localtime_r(time_value, out) != NULL;
+#endif
+}
+
+#ifndef _WIN32
+static const char *cached_user_name(NameCache *cache, uid_t uid) {
+    for (size_t i = 0; i < cache->user_count; i++) {
+        if (cache->users[i].uid == uid) {
+            return cache->users[i].name;
+        }
+    }
+
+    struct passwd *pw = getpwuid(uid);
+    const char *name = pw ? pw->pw_name : "?";
+
+    if (cache->user_count < NAME_CACHE_LIMIT) {
+        UserCacheEntry *slot = &cache->users[cache->user_count++];
+        slot->uid = uid;
+        snprintf(slot->name, sizeof(slot->name), "%s", name);
+        return slot->name;
+    }
+
+    return name;
+}
+
+static const char *cached_group_name(NameCache *cache, gid_t gid) {
+    for (size_t i = 0; i < cache->group_count; i++) {
+        if (cache->groups[i].gid == gid) {
+            return cache->groups[i].name;
+        }
+    }
+
+    struct group *gr = getgrgid(gid);
+    const char *name = gr ? gr->gr_name : "?";
+
+    if (cache->group_count < NAME_CACHE_LIMIT) {
+        GroupCacheEntry *slot = &cache->groups[cache->group_count++];
+        slot->gid = gid;
+        snprintf(slot->name, sizeof(slot->name), "%s", name);
+        return slot->name;
+    }
+
+    return name;
+}
+#endif
+
+static void owner_group_strings(const struct stat *st, NameCache *cache, char *user,
+                                size_t user_size, char *group, size_t group_size) {
 #ifdef _WIN32
     (void)st;
+    (void)cache;
 
     snprintf(user, user_size, "-");
     snprintf(group, group_size, "-");
 #else
-    struct passwd *pw = getpwuid(st->st_uid);
-
-    // Important:
-    // getgrgid() must use st_gid, not st_uid.
-    struct group *gr = getgrgid(st->st_gid);
-
-    snprintf(user, user_size, "%s", pw ? pw->pw_name : "?");
-    snprintf(group, group_size, "%s", gr ? gr->gr_name : "?");
+    snprintf(user, user_size, "%s", cached_user_name(cache, st->st_uid));
+    snprintf(group, group_size, "%s", cached_group_name(cache, st->st_gid));
 #endif
 }
 
-// takes a directory string and a name strings
-void print_long(const char *dir, const char *name) {
-    // a buffer to hold the max path size we are allowing in this learning project
-    char fullpath[PATH_BUFFER_SIZE];
+static void format_time(time_t modified_time, char *timebuf, size_t timebuf_size) {
+    struct tm tm_value;
 
-    // used to write formatted data string into a sized character buffer
-    // helps us ensure the path fits in a buffer of the max path size
-    join_path(fullpath, sizeof(fullpath), dir, name);
-
-    // initialize an empty struct
-    struct stat st;
-
-    // on linux this uses lstat
-    // on windows this uses stat
-    if (stat_file(fullpath, &st) < 0) {
-        perror(fullpath);
+    if (!localtime_safe(&modified_time, &tm_value)) {
+        snprintf(timebuf, timebuf_size, "?");
         return;
     }
 
-    char modes[11];
-    mode_string(fullpath, st.st_mode, modes);
+    if (strftime(timebuf, timebuf_size, "%b %d %H:%M", &tm_value) == 0) {
+        snprintf(timebuf, timebuf_size, "?");
+    }
+}
 
-    char user[64];
-    char group[64];
-    owner_group_strings(&st, user, sizeof(user), group, sizeof(group));
+static void print_long_from_stat(const char *type_path, const char *display_name,
+                                 const struct stat *st, NameCache *cache) {
+    char modes[11];
+    mode_string(type_path, st->st_mode, modes);
+
+    char user[NAME_FIELD_SIZE];
+    char group[NAME_FIELD_SIZE];
+    owner_group_strings(st, cache, user, sizeof(user), group, sizeof(group));
 
     char timebuf[64];
+    format_time(st->st_mtime, timebuf, sizeof(timebuf));
 
-    // st_mtime is portable enough for this case.
-    // On Linux it maps to the modification time.
-    // On Windows CRT it is also the modification time.
-    time_t modified_time = st.st_mtime;
-    struct tm *tm = localtime(&modified_time);
+    printf("%s %" PRIuMAX " %-8s %-8s %8" PRIdMAX " %s %s\n", modes, (uintmax_t)st->st_nlink, user,
+           group, (intmax_t)st->st_size, timebuf, display_name);
+}
 
-    if (tm == NULL) {
-        snprintf(timebuf, sizeof(timebuf), "?");
-    } else {
-        strftime(timebuf, sizeof(timebuf), "%b %e %H:%M", tm);
+static int print_single_path(const char *path, const Options *options, NameCache *cache) {
+    struct stat st;
+
+    if (stat_path_no_follow(path, &st) < 0) {
+        perror(path);
+        return -1;
     }
 
-    printf("%s %lu %-8s %-8s %8ld %s %s\n", modes, (unsigned long)st.st_nlink, user, group,
-           (long)st.st_size, timebuf, name);
+    if (options->long_format) {
+        print_long_from_stat(path, path, &st, cache);
+    } else {
+        puts(path);
+    }
+
+    return 0;
 }
 
-// Print help message for invalid usage.
-void print_usage(const char *program_name) {
-    fprintf(stderr, "usage: %s [-al] [path]\n", program_name);
+static int compare_entry_ptrs_by_name(const void *a, const void *b) {
+    const DirectoryEntry *const *entry_a = a;
+    const DirectoryEntry *const *entry_b = b;
+
+    return strcmp((*entry_a)->name, (*entry_b)->name);
 }
 
-// Simple option parser.
-//
-// You were using getopt(), which is standard POSIX and works well on Linux.
-// But getopt() is not a safe assumption for native Windows portability.
-//
-// For this small project, manual parsing is simpler and makes the program
-// easier to compile on both Windows and Linux.
-const char *parse_args(int argc, char *argv[]) {
-    const char *path = ".";
+static int make_entry_type_path(char *out, size_t out_size, const char *dir_path,
+                                const DirectoryEntry *entry, const char **type_path) {
+#ifdef _WIN32
+    if (join_path_checked(out, out_size, dir_path, entry->name) < 0) {
+        return -1;
+    }
 
-    // argv[0] is the program name, so real arguments start at index 1.
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-a") == 0) {
-            show_all = 1;
-        } else if (strcmp(argv[i], "-l") == 0) {
-            long_format = 1;
-        } else if (strcmp(argv[i], "-al") == 0 || strcmp(argv[i], "-la") == 0) {
-            show_all = 1;
-            long_format = 1;
-        } else if (argv[i][0] == '-') {
-            print_usage(argv[0]);
-            return NULL;
-        } else {
-            // First non-option argument is the path.
-            path = argv[i];
+    *type_path = out;
+#else
+    (void)out;
+    (void)out_size;
+    (void)dir_path;
+    (void)entry;
+
+    // On POSIX, lstat/fstatat already cached the file type in st_mode.
+    *type_path = NULL;
+#endif
+
+    return 0;
+}
+
+static int append_entry(DIR *dir, const char *dir_path, const char *name, const Options *options,
+                        DirectoryEntry **entries, size_t *count, size_t *capacity,
+                        unsigned long long *total_blocks) {
+    if (*count >= *capacity) {
+        if (grow_entries(entries, capacity) < 0) {
+            perror("realloc");
+            return -1;
         }
     }
 
-    return path;
-}
-
-// GNU ls normally prints total allocation in 1024-byte blocks.
-// We keep this as a constant so the conversion is easy to understand.
-#define LS_BLOCK_SIZE 1024ULL
-
-// Integer division that rounds upward.
-// Example:
-//   1 byte / 1024 -> 1 block
-//   1024 bytes / 1024 -> 1 block
-//   1025 bytes / 1024 -> 2 blocks
-unsigned long long round_up_div_ull(unsigned long long value, unsigned long long divisor) {
-    if (value == 0) {
-        return 0;
+    char *name_copy = copy_string(name);
+    if (name_copy == NULL) {
+        perror("malloc");
+        return -1;
     }
 
-    return (value + divisor - 1) / divisor;
-}
+    DirectoryEntry entry = {0};
+    entry.name = name_copy;
 
-// Return how many 1024-byte "ls blocks" this file uses.
-//
-// Linux:
-//   st_blocks is allocation count in 512-byte units.
-//   GNU ls prints total in 1024-byte units by default.
-//   So we convert 512-byte blocks -> 1024-byte blocks.
-//
-// Windows:
-//   struct stat does not give us Unix-like st_blocks.
-//   So we open the file and ask Windows for FILE_STANDARD_INFO.AllocationSize.
-unsigned long long allocated_blocks_1024(const char *path, const struct stat *st) {
+    if (options->long_format) {
+        if (stat_entry_in_open_dir(dir, dir_path, name_copy, &entry.st) < 0) {
+            perror(name_copy);
+            free(name_copy);
+            return 0; // Skip this entry, but keep listing the rest.
+        }
+
+        entry.has_stat = 1;
+
 #ifdef _WIN32
-    (void)st;
-
-    HANDLE handle =
-        CreateFileA(path,
-                    0, // We are not reading file contents; we only want metadata.
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS, // Allows opening directories too.
-                    NULL);
-
-    if (handle == INVALID_HANDLE_VALUE) {
-        // Fallback for learning purposes:
-        // if Windows metadata fails, estimate from logical size.
-        return round_up_div_ull((unsigned long long)st->st_size, LS_BLOCK_SIZE);
-    }
-
-    FILE_STANDARD_INFO info;
-
-    BOOL ok = GetFileInformationByHandleEx(handle, FileStandardInfo, &info, sizeof(info));
-
-    CloseHandle(handle);
-
-    if (!ok) {
-        // Fallback for learning purposes.
-        return round_up_div_ull((unsigned long long)st->st_size, LS_BLOCK_SIZE);
-    }
-
-    return round_up_div_ull((unsigned long long)info.AllocationSize.QuadPart, LS_BLOCK_SIZE);
-#else
-    (void)path;
-
-    // Linux st_blocks is in 512-byte units.
-    // GNU ls default total is in 1024-byte units.
-    // So 2 stat blocks = 1 ls block.
-    //
-    // We round up because 1 allocated 512-byte block should still show as 1
-    // 1024-byte ls block, not 0.
-    return (unsigned long long)((st->st_blocks + 1) / 2);
-#endif
-}
-
-// Calculate the "total" line for a directory listing.
-//
-// This loops through the names you already collected, stats each one,
-// asks how much filesystem allocation it uses, and sums the result.
-unsigned long long directory_total_blocks_1024(const char *dir, char **names, size_t count) {
-    unsigned long long total = 0;
-
-    for (size_t i = 0; i < count; i++) {
         char fullpath[PATH_BUFFER_SIZE];
 
-        join_path(fullpath, sizeof(fullpath), dir, names[i]);
-
-        struct stat st;
-
-        if (stat_file(fullpath, &st) < 0) {
-            // If we cannot stat one file, skip it.
-            // Real ls has more nuanced behavior, but this is enough for learning.
-            perror(fullpath);
-            continue;
+        if (join_path_checked(fullpath, sizeof(fullpath), dir_path, name_copy) < 0) {
+            perror(name_copy);
+            free(name_copy);
+            return 0;
         }
 
-        total += allocated_blocks_1024(fullpath, &st);
+        entry.blocks = allocated_blocks_1024(fullpath, &entry.st);
+#else
+        entry.blocks = allocated_blocks_1024(NULL, &entry.st);
+#endif
+
+        *total_blocks += entry.blocks;
     }
 
-    return total;
+    (*entries)[*count] = entry;
+    (*count)++;
+    return 0;
 }
 
-typedef struct DirectoryEntry {
-    char *name;
-    struct stat st;
-    unsigned long long blocks;
-    int has_stat;
-} DirectoryEntry;
-
-// Compare two DirectoryEntry values by name.
-// qsort gives us void pointers, so we cast them back to DirectoryEntry pointers.
-//
-// qsort expects the comparator to return:
-//   negative -> first item comes before second
-//   zero     -> equal
-//   positive -> first item comes after second
-int compare_entries_by_name(const void *a, const void *b) {
-    const DirectoryEntry *entry_a = a;
-    const DirectoryEntry *entry_b = b;
-
-    return strcmp(entry_a->name, entry_b->name);
-}
-
-// Free all allocated names inside the entries array, then free the array itself.
-void free_entries(DirectoryEntry *entries, size_t count) {
-    if (entries == NULL) {
-        return;
-    }
-
-    for (size_t i = 0; i < count; i++) {
-        free(entries[i].name);
-    }
-
-    free(entries);
-}
-
-// This is like print_long(), but it receives the already-loaded stat data.
-// That avoids calling stat_file() again during printing.
-void print_long_cached(const char *dir, const DirectoryEntry *entry) {
-    char fullpath[PATH_BUFFER_SIZE];
-
-    join_path(fullpath, sizeof(fullpath), dir, entry->name);
-
-    char modes[11];
-    mode_string(fullpath, entry->st.st_mode, modes);
-
-    char user[64];
-    char group[64];
-    owner_group_strings(&entry->st, user, sizeof(user), group, sizeof(group));
-
-    char timebuf[64];
-
-    time_t modified_time = entry->st.st_mtime;
-    struct tm *tm = localtime(&modified_time);
-
-    if (tm == NULL) {
-        snprintf(timebuf, sizeof(timebuf), "?");
-    } else {
-        strftime(timebuf, sizeof(timebuf), "%b %e %H:%M", tm);
-    }
-
-    printf("%s %lu %-8s %-8s %8ld %s %s\n", modes, (unsigned long)entry->st.st_nlink, user, group,
-           (long)entry->st.st_size, timebuf, entry->name);
-}
-
-// to take parameters we need to change it from void to int argc, char *argv[]
-// int argc = means the argument count, how many words when they ran the program
-// char *argv[] = a pointer to a pointer of an array of strings, in C strings
-// are an array of chars
-int main(int argc, char *argv[]) {
-    const char *path = parse_args(argc, argv);
-
-    if (path == NULL) {
-        return 1;
-    }
-
-    // DIR is an opaque type, we dont need to know what it is, but the systems
-    // knows what it is and knows how to use it. It represents a directory type.
-    // opendir allows to check if a directory exits and know its contents
+static int list_directory(const char *path, const Options *options, NameCache *cache) {
     DIR *dir = opendir(path);
 
     if (dir == NULL) {
-        // perror will check the error and return its human readable prefix with the
-        // errmsg
-        perror("opendir");
+        if (errno == ENOTDIR) {
+            return print_single_path(path, options, cache);
+        }
 
-        // 1 = error code
-        return 1;
+        perror(path);
+        return -1;
     }
 
-    // create a reference pointer struct to dirent struc
-    struct dirent *entry;
-
-    // count the number of items inside the dir
     size_t count = 0;
+    size_t capacity = INITIAL_ENTRY_CAPACITY;
 
-    // Initial size
-    size_t capacity = 64;
-
-    // Instead of storing only char *, we store a DirectoryEntry.
-    // This lets us keep the name plus cached stat data.
-    DirectoryEntry *entries = malloc(capacity * sizeof(DirectoryEntry));
-
+    DirectoryEntry *entries = malloc(capacity * sizeof(*entries));
     if (entries == NULL) {
-        // Handle allocation failure.
-        // Since opendir() already succeeded, we must also close the directory.
         perror("malloc");
         closedir(dir);
-        return 1;
+        return -1;
     }
 
-    // This will hold the GNU ls-like "total" value for -l.
-    // It is filesystem allocation in 1024-byte blocks, not number of entries.
     unsigned long long total_blocks = 0;
 
-    // while there are entries, count them and put them into an array buffer
-    while ((entry = readdir(dir)) != NULL) {
-        // check if the first element of the name is a dot, skipping it. Here we use
-        // single '' that creates a normal char, instead of "" which is a pointer
-        // char
-        if (!show_all && entry->d_name[0] == '.') {
-            // continue means, exit the iteration
+    for (;;) {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+
+        if (entry == NULL) {
+            if (errno != 0) {
+                perror("readdir");
+                closedir(dir);
+                free_entries(entries, count);
+                return -1;
+            }
+
+            break;
+        }
+
+        if (should_skip_name(options, entry->d_name)) {
             continue;
         }
 
-        // 2. Expand list if full
-        if (count >= capacity) {
-            // Avoid overflow before multiplying capacity.
-            if (capacity > SIZE_MAX / 2) {
-                fprintf(stderr, "too many directory entries\n");
-                closedir(dir);
-                free_entries(entries, count);
-                return 1;
-            }
-
-            // increase capacity
-            capacity *= 2;
-
-            // resize array buffer
-            DirectoryEntry *temp_array = realloc(entries, capacity * sizeof(DirectoryEntry));
-
-            if (temp_array == NULL) {
-                perror("realloc");
-                closedir(dir);
-                free_entries(entries, count);
-                return 1;
-            }
-
-            entries = temp_array;
-        }
-
-        // 3. "Push" name into list.
-        //
-        // We copy the name because readdir() owns the returned data.
-        // The next readdir() call may overwrite it.
-        char *name_copy = copy_string(entry->d_name);
-
-        if (name_copy == NULL) {
-            perror("copy_string");
+        if (append_entry(dir, path, entry->d_name, options, &entries, &count, &capacity,
+                         &total_blocks) < 0) {
             closedir(dir);
             free_entries(entries, count);
-            return 1;
+            return -1;
         }
-
-        entries[count].name = name_copy;
-        entries[count].has_stat = 0;
-        entries[count].blocks = 0;
-
-        // If we are in long format, read file metadata now and cache it.
-        // This avoids doing one metadata pass for "total" and another metadata
-        // pass inside print_long().
-        if (long_format) {
-            char fullpath[PATH_BUFFER_SIZE];
-
-            join_path(fullpath, sizeof(fullpath), path, name_copy);
-
-            if (stat_file(fullpath, &entries[count].st) < 0) {
-                // If metadata fails, report it and skip this entry.
-                perror(fullpath);
-                free(entries[count].name);
-                continue;
-            }
-
-            entries[count].has_stat = 1;
-            entries[count].blocks = allocated_blocks_1024(fullpath, &entries[count].st);
-            total_blocks += entries[count].blocks;
-        }
-
-        count++;
     }
 
-    // close the directory, freeing it to other programs
-    closedir(dir);
+    if (closedir(dir) != 0) {
+        perror("closedir");
+        free_entries(entries, count);
+        return -1;
+    }
 
-    // GNU ls sorts by default.
-    // qsort sorts the array using compare_entries_by_name.
-    qsort(entries, count, sizeof(entries[0]), compare_entries_by_name);
+    DirectoryEntry **order = malloc(count * sizeof(*order));
 
-    // 4. Print and cleanup
-    if (long_format) {
+    if (count > 0 && order == NULL) {
+        perror("malloc");
+        free_entries(entries, count);
+        return -1;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        order[i] = &entries[i];
+    }
+
+    qsort(order, count, sizeof(order[0]), compare_entry_ptrs_by_name);
+
+    if (options->long_format) {
         printf("total %llu\n", total_blocks);
     }
 
     for (size_t i = 0; i < count; i++) {
-        if (long_format) {
-            // We already cached stat data while reading the directory.
-            // So this should not call stat_file() again.
-            if (entries[i].has_stat) {
-                print_long_cached(path, &entries[i]);
+        const DirectoryEntry *current = order[i];
+
+        if (options->long_format) {
+            if (!current->has_stat) {
+                continue;
             }
+
+            char type_path_buffer[PATH_BUFFER_SIZE];
+            const char *type_path = NULL;
+
+            if (make_entry_type_path(type_path_buffer, sizeof(type_path_buffer), path, current,
+                                     &type_path) < 0) {
+                perror(current->name);
+                continue;
+            }
+
+            print_long_from_stat(type_path, current->name, &current->st, cache);
         } else {
-            printf("%s\n", entries[i].name);
+            puts(current->name);
         }
     }
 
-    // free from memory
+    free(order);
     free_entries(entries, count);
-
-    // exit main with success
     return 0;
+}
+
+int main(int argc, char *argv[]) {
+    static char stdout_buffer[OUTPUT_BUFFER_SIZE];
+
+    (void)setvbuf(stdout, stdout_buffer, _IOFBF, sizeof(stdout_buffer));
+
+    Options options;
+    const char *path = NULL;
+
+    int parse_result = parse_args(argc, argv, &options, &path);
+    if (parse_result != 0) {
+        return parse_result < 0 ? 1 : 0;
+    }
+
+    NameCache cache = {0};
+
+    if (options.directory_itself) {
+        return print_single_path(path, &options, &cache) == 0 ? 0 : 1;
+    }
+
+    return list_directory(path, &options, &cache) == 0 ? 0 : 1;
 }

@@ -236,6 +236,8 @@ static int stat_path_no_follow(const char *path, struct stat *st) {
 static int stat_entry_in_open_dir(DIR *dir, const char *dir_path, const char *name,
                                   struct stat *st) {
 #ifdef _WIN32
+    (void)dir;
+
     char fullpath[PATH_BUFFER_SIZE];
 
     if (join_path_checked(fullpath, sizeof(fullpath), dir_path, name) < 0) {

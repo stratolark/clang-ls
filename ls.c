@@ -38,6 +38,7 @@
 
 #include <dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -360,7 +361,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // while there are entries, print their names
+    // while there are entries, count them and put them into an array buffer
     while ((entry = readdir(dir)) != NULL) {
         // check if the first element of the name is a dot, skipping it. Here we use
         // single '' that creates a normal char, instead of "" which is a pointer
@@ -381,27 +382,27 @@ int main(int argc, char *argv[]) {
                 printf("realloc");
                 break;
             }
+            // set the temp array to the original
             names_output_buffer = temp_array;
         }
 
         // 3. "Push" name into list (strdup allocates memory for the string copy)
         names_output_buffer[count++] = strdup(entry->d_name);
-
-        if (long_format) {
-            print_long(path, entry->d_name);
-        } else {
-
-            printf("%s\n", entry->d_name);
-        }
     }
 
     // close the directory, freeing it to other programs
     closedir(dir);
 
     // 4. Print and cleanup
-    printf("Items found:\n");
+    printf("total %zu\n", count);
     for (size_t i = 0; i < count; i++) {
-        printf("[%zu] %s\n", i, names_output_buffer[i]);
+        // printf("[%zu] %s\n", i, names_output_buffer[i]);
+        if (long_format) {
+            print_long(path, names_output_buffer[i]);
+        } else {
+            printf("%s\n", names_output_buffer[i]);
+        }
+
         free(names_output_buffer[i]); // Free individual string
     }
 

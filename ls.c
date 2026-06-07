@@ -37,6 +37,7 @@
 #endif
 
 #include <dirent.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -455,6 +456,69 @@ unsigned long long directory_total_blocks_1024(const char *dir, char **names, si
     return total;
 }
 
+typedef struct DirectoryEntry {
+    char *name;
+    struct stat st;
+    unsigned long long blocks;
+    int has_stat;
+} DirectoryEntry;
+
+// Compare two DirectoryEntry values by name.
+// qsort gives us void pointers, so we cast them back to DirectoryEntry pointers.
+//
+// qsort expects the comparator to return:
+//   negative -> first item comes before second
+//   zero     -> equal
+//   positive -> first item comes after second
+int compare_entries_by_name(const void *a, const void *b) {
+    const DirectoryEntry *entry_a = a;
+    const DirectoryEntry *entry_b = b;
+
+    return strcmp(entry_a->name, entry_b->name);
+}
+
+// Free all allocated names inside the entries array, then free the array itself.
+void free_entries(DirectoryEntry *entries, size_t count) {
+    if (entries == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        free(entries[i].name);
+    }
+
+    free(entries);
+}
+
+// This is like print_long(), but it receives the already-loaded stat data.
+// That avoids calling stat_file() again during printing.
+void print_long_cached(const char *dir, const DirectoryEntry *entry) {
+    char fullpath[PATH_BUFFER_SIZE];
+
+    join_path(fullpath, sizeof(fullpath), dir, entry->name);
+
+    char modes[11];
+    mode_string(fullpath, entry->st.st_mode, modes);
+
+    char user[64];
+    char group[64];
+    owner_group_strings(&entry->st, user, sizeof(user), group, sizeof(group));
+
+    char timebuf[64];
+
+    time_t modified_time = entry->st.st_mtime;
+    struct tm *tm = localtime(&modified_time);
+
+    if (tm == NULL) {
+        snprintf(timebuf, sizeof(timebuf), "?");
+    } else {
+        strftime(timebuf, sizeof(timebuf), "%b %e %H:%M", tm);
+    }
+
+    printf("%s %lu %-8s %-8s %8ld %s %s\n", modes, (unsigned long)entry->st.st_nlink, user, group,
+           (long)entry->st.st_size, timebuf, entry->name);
+}
+
 // to take parameters we need to change it from void to int argc, char *argv[]
 // int argc = means the argument count, how many words when they ran the program
 // char *argv[] = a pointer to a pointer of an array of strings, in C strings
@@ -470,6 +534,7 @@ int main(int argc, char *argv[]) {
     // knows what it is and knows how to use it. It represents a directory type.
     // opendir allows to check if a directory exits and know its contents
     DIR *dir = opendir(path);
+
     if (dir == NULL) {
         // perror will check the error and return its human readable prefix with the
         // errmsg
@@ -484,18 +549,25 @@ int main(int argc, char *argv[]) {
 
     // count the number of items inside the dir
     size_t count = 0;
+
     // Initial size
     size_t capacity = 64;
 
-    // 1. Initial list allocation, Initialize a pointer-to-pointer (char **names) to hold your list
-    // of string addresses
-    char **names_output_buffer = malloc(capacity * sizeof(char *));
+    // Instead of storing only char *, we store a DirectoryEntry.
+    // This lets us keep the name plus cached stat data.
+    DirectoryEntry *entries = malloc(capacity * sizeof(DirectoryEntry));
 
-    if (names_output_buffer == NULL) {
-        // Handle allocation failure
+    if (entries == NULL) {
+        // Handle allocation failure.
+        // Since opendir() already succeeded, we must also close the directory.
         perror("malloc");
+        closedir(dir);
         return 1;
     }
+
+    // This will hold the GNU ls-like "total" value for -l.
+    // It is filesystem allocation in 1024-byte blocks, not number of entries.
+    unsigned long long total_blocks = 0;
 
     // while there are entries, count them and put them into an array buffer
     while ((entry = readdir(dir)) != NULL) {
@@ -509,59 +581,96 @@ int main(int argc, char *argv[]) {
 
         // 2. Expand list if full
         if (count >= capacity) {
+            // Avoid overflow before multiplying capacity.
+            if (capacity > SIZE_MAX / 2) {
+                fprintf(stderr, "too many directory entries\n");
+                closedir(dir);
+                free_entries(entries, count);
+                return 1;
+            }
+
             // increase capacity
             capacity *= 2;
+
             // resize array buffer
-            char **temp_array = realloc(names_output_buffer, capacity * sizeof(char *));
+            DirectoryEntry *temp_array = realloc(entries, capacity * sizeof(DirectoryEntry));
 
             if (temp_array == NULL) {
                 perror("realloc");
                 closedir(dir);
-                free_names(names_output_buffer, count);
+                free_entries(entries, count);
                 return 1;
             }
 
-            names_output_buffer = temp_array;
+            entries = temp_array;
         }
 
-        // 3. "Push" name into list (strdup allocates memory for the string copy)
+        // 3. "Push" name into list.
+        //
+        // We copy the name because readdir() owns the returned data.
+        // The next readdir() call may overwrite it.
         char *name_copy = copy_string(entry->d_name);
 
         if (name_copy == NULL) {
             perror("copy_string");
             closedir(dir);
-            free_names(names_output_buffer, count);
+            free_entries(entries, count);
             return 1;
         }
 
-        names_output_buffer[count++] = name_copy;
+        entries[count].name = name_copy;
+        entries[count].has_stat = 0;
+        entries[count].blocks = 0;
+
+        // If we are in long format, read file metadata now and cache it.
+        // This avoids doing one metadata pass for "total" and another metadata
+        // pass inside print_long().
+        if (long_format) {
+            char fullpath[PATH_BUFFER_SIZE];
+
+            join_path(fullpath, sizeof(fullpath), path, name_copy);
+
+            if (stat_file(fullpath, &entries[count].st) < 0) {
+                // If metadata fails, report it and skip this entry.
+                perror(fullpath);
+                free(entries[count].name);
+                continue;
+            }
+
+            entries[count].has_stat = 1;
+            entries[count].blocks = allocated_blocks_1024(fullpath, &entries[count].st);
+            total_blocks += entries[count].blocks;
+        }
+
+        count++;
     }
 
     // close the directory, freeing it to other programs
     closedir(dir);
-    qsort(names_output_buffer, count, sizeof(names_output_buffer[0]), compare_names);
+
+    // GNU ls sorts by default.
+    // qsort sorts the array using compare_entries_by_name.
+    qsort(entries, count, sizeof(entries[0]), compare_entries_by_name);
 
     // 4. Print and cleanup
     if (long_format) {
-        unsigned long long total_blocks =
-            directory_total_blocks_1024(path, names_output_buffer, count);
-
         printf("total %llu\n", total_blocks);
     }
-    for (size_t i = 0; i < count; i++) {
-        // printf("[%zu] %s\n", i, names_output_buffer[i]);
-        if (long_format) {
-            print_long(path, names_output_buffer[i]);
-        } else {
-            printf("%s\n", names_output_buffer[i]);
-        }
 
-        free(names_output_buffer[i]); // Free individual string
+    for (size_t i = 0; i < count; i++) {
+        if (long_format) {
+            // We already cached stat data while reading the directory.
+            // So this should not call stat_file() again.
+            if (entries[i].has_stat) {
+                print_long_cached(path, &entries[i]);
+            }
+        } else {
+            printf("%s\n", entries[i].name);
+        }
     }
 
     // free from memory
-    free(names_output_buffer);
-    names_output_buffer = NULL; // Good practice to prevent dangling pointers
+    free_entries(entries, count);
 
     // exit main with success
     return 0;
